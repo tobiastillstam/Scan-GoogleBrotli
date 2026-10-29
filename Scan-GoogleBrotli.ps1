@@ -98,10 +98,14 @@
                          package.json names and scoped Node packages detected. ExcludePath
                          prunes on path boundaries. Junctions and symlinks are not followed.
                          HKEY_USERS uninstall keys. -Credential. Input validated in the body.
+                         Duplicate drive letters walked once. Report names include the
+                         scanning host and milliseconds and never overwrite earlier runs.
     1.0.0 (2026-10-29) - Initial import.
 
     Operational notes:
-    - Output: <OutputPath>\GoogleBrotli-<timestamp>.csv and .log.
+    - Output: <OutputPath>\GoogleBrotli-<COMPUTER>-<yyyyMMdd-HHmmss-fff>.csv and .log,
+      where COMPUTER is the host running the scan. The CSV name is reserved atomically;
+      if it is taken, -1, -2 ... is appended, so a run never overwrites earlier evidence.
     - CSV columns: Computer, Category, Location, Detail. UTF-8 with BOM so non-ASCII
       paths survive and Excel opens it correctly.
     - A full walk of every fixed drive can take a long time on large file servers;
@@ -111,6 +115,9 @@
     - Folders that cannot be read are skipped and counted per target (see the log, and
       -Verbose for the paths). They do not change the exit code.
     - "User" environment variables and HKCU are those of the account running the scan.
+    - Process scope is the scanner's own process. A Process variable is only reported when
+      no Machine/User variable of the same name was (PATH is a merge of both), so extra
+      entries the launching session added to an already reported PATH are not listed.
     - Brotli is bundled inside many products (browsers, web servers, runtimes). A
       FileSystem hit is a lead to review, not proof of a vulnerable install.
     - Parameter binding errors (unknown parameter name, value of the wrong type) are raised
@@ -323,6 +330,28 @@ $ScanBlock = {
 }
 
 # -------------------------------------------------------------------------
+# Helpers
+# -------------------------------------------------------------------------
+function New-ReportBaseName {
+    # Reserves <Prefix>.csv (or <Prefix>-1.csv, -2 ...) by creating it with CreateNew, which
+    # fails if the file exists - so concurrent runs into one folder never share a name.
+    param([string]$Folder, [string]$Prefix)
+    for ($n = 0; $n -lt 1000; $n++) {
+        $name = if ($n -eq 0) { $Prefix } else { "$Prefix-$n" }
+        $csv  = Join-Path $Folder "$name.csv"
+        if ([System.IO.File]::Exists($csv) -or [System.IO.File]::Exists((Join-Path $Folder "$name.log"))) { continue }
+        try {
+            [System.IO.File]::Open($csv, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write).Dispose()
+            return $name
+        }
+        catch [System.IO.IOException] {
+            # Taken by a concurrent run between the check and the create; try the next suffix
+        }
+    }
+    throw "No free report name for '$Prefix' in $Folder"
+}
+
+# -------------------------------------------------------------------------
 # Begin script body
 # -------------------------------------------------------------------------
 
@@ -348,9 +377,9 @@ try {
     if (-not (Test-Path -LiteralPath $OutputPath -PathType Container)) {
         New-Item -ItemType Directory -Path $OutputPath -Force -WhatIf:$false -Confirm:$false -ErrorAction Stop | Out-Null
     }
-    $stamp   = Get-Date -Format 'yyyyMMdd-HHmmss'
-    $csvPath = Join-Path $OutputPath "GoogleBrotli-$stamp.csv"
-    $logPath = Join-Path $OutputPath "GoogleBrotli-$stamp.log"
+    $baseName = New-ReportBaseName -Folder $OutputPath -Prefix "GoogleBrotli-$env:COMPUTERNAME-$(Get-Date -Format 'yyyyMMdd-HHmmss-fff')"
+    $csvPath  = Join-Path $OutputPath "$baseName.csv"
+    $logPath  = Join-Path $OutputPath "$baseName.log"
     Start-Transcript -LiteralPath $logPath -Force -WhatIf:$false -Confirm:$false -ErrorAction Stop | Out-Null
     $transcriptStarted = $true
     Write-Verbose "Scan-GoogleBrotli 1.1.0 on $env:COMPUTERNAME as $([Environment]::UserDomainName)\$([Environment]::UserName)"
@@ -364,6 +393,8 @@ try {
     foreach ($d in $Drives) {
         if ([string]$d -notmatch '^\s*[A-Za-z](:\\?)?\s*$') { throw "Invalid drive '$d'. Use a letter such as C, C: or C:\" }
     }
+    # C, C: and c are the same drive: walk it once
+    $Drives = @($Drives | ForEach-Object { $_.Trim().Substring(0, 1).ToUpper() } | Select-Object -Unique)
 
     # --- Resolve target list ---------------------------------------------
     Write-Verbose '--- Resolving target list ---'

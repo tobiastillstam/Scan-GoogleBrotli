@@ -56,11 +56,14 @@ short or DNS name) are scanned locally, not over WinRM.
 
 ## Output
 
-- `Reports\GoogleBrotli-<timestamp>.csv` - one row per finding
+- `Reports\GoogleBrotli-<COMPUTER>-<yyyyMMdd-HHmmss-fff>.csv` - one row per finding
   (`Computer`, `Category`, `Location`, `Detail`), UTF-8 with BOM.
   **Written on every run**; header row only when nothing is found.
-- `Reports\GoogleBrotli-<timestamp>.log` - transcript of the run, with a
-  per-target line (findings, unreadable folders, warnings).
+- `Reports\GoogleBrotli-<COMPUTER>-<yyyyMMdd-HHmmss-fff>.log` - transcript of the
+  run, with a per-target line (findings, unreadable folders, warnings).
+- `<COMPUTER>` is the host running the scan. If a name is already taken, `-1`,
+  `-2` ... is appended, so concurrent runs into a shared folder never overwrite
+  each other's evidence.
 - Targets that could not be scanned are listed as a warning at the end.
 
 ## Exit codes
@@ -85,6 +88,11 @@ but do not change the exit code. PowerShell's own parameter binding errors
 - Junctions, symlinks and mount points are reported when their name matches
   but are not followed. Volumes mounted only into a folder are not walked.
 - "User" environment variables and HKCU belong to the account running the scan.
+- Process scope is the scanner's own process, not other processes on the server.
+  A Process variable is only reported when no Machine/User variable of the same
+  name was (PATH is a merge of both), so session-only additions to an already
+  reported PATH are not listed separately.
+- Repeated drive letters (`-Drives C,C:,c`) are walked once.
 - Brotli is bundled inside many products (browsers, web servers, runtimes).
   A `FileSystem` hit is a lead to review, not proof of a vulnerable install.
 - `-WhatIf` is accepted but has no effect: the scan is read-only and the

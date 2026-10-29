@@ -30,9 +30,14 @@ All notable changes to this project are documented here. The format is based on
   (`D:\Backup` no longer excludes `D:\Backup2`).
 - Junctions, symlinks and mount points are not followed.
 - Input is validated inside the script so bad input exits 3, not 1.
+- Report names are `GoogleBrotli-<COMPUTER>-<yyyyMMdd-HHmmss-fff>` and reserved
+  atomically, with a `-1`, `-2` ... suffix if taken.
 
 ### Fixed
 - `-Drives 'C:\'` silently scanned nothing.
+- `-Drives C,C:` walked the same drive twice and reported every finding twice.
+- Runs started in the same second into one folder overwrote each other's CSV,
+  or failed with exit 3 on the shared transcript file.
 - Duplicate target names differing only in case were scanned twice.
 - An empty `-ListPath` file silently fell back to a local scan (now exit 3).
 - `-ComputerName A,B` / `-Drives C,D` via `powershell.exe -File` were taken as one value.

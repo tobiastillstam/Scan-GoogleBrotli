@@ -3,9 +3,9 @@
 Read-only audit for Google Brotli traces on Windows servers (local or WinRM).
 Single script: `Scan-GoogleBrotli.ps1`.
 
-Test suite: `Tests\Invoke-ScanTests.ps1` (local only, `Tests/` is gitignored).
-Static template checks + functional runs on subst-mapped fixtures under
-powershell.exe and pwsh. Exit 0 = all pass.
+Test suite: `Tests\Invoke-ScanTests.ps1` (local only, `Tests/` is gitignored,
+so clones cannot rerun it). Static template checks + functional runs on
+subst-mapped fixtures under powershell.exe and pwsh. Exit 0 = all pass.
 
 ## Conventions
 
@@ -33,5 +33,13 @@ powershell.exe and pwsh. Exit 0 = all pass.
   Junctions are not followed.
 - Names that mean this computer are scanned locally, never over WinRM.
 - CSV columns are selected explicitly so remoting properties never leak in.
+- Repeated drive letters are deduplicated before the walk.
+- Report names = GoogleBrotli-<scanning host>-<ms stamp>, reserved with
+  FileMode.CreateNew, -N suffix if taken. Helper function New-ReportBaseName
+  has its own try/catch; it sits outside the main body.
+- Process env vars stay skipped when a Machine/User var of the same name was
+  reported. Process scope = the scanner's own session, not the server;
+  reporting differing values would duplicate PATH on every hit.
+  Documented in README and .NOTES instead.
 - Test harness omits `#Requires -RunAsAdministrator` (deviation
   from template) so it runs in a normal session.
