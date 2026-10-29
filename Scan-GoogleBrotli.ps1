@@ -7,32 +7,59 @@
 
 .DESCRIPTION
     Searches each target for signs of Google Brotli (the "brotli" / "google-brotli" packages):
-      1. Files and folders named *brotli* on all fixed drives
-      2. Python installs: Brotli-*.dist-info, brotli*.egg-info and their METADATA name
-      3. Node.js installs: node_modules\brotli or node_modules\google-brotli (package.json name)
+      1. Files and folders named *brotli* on all fixed drives (or -Drives)
+      2. Python installs found by the same walk: Brotli-*.dist-info / *.egg-info
+         (Name and Version from METADATA / PKG-INFO), site-packages\brotli.py,
+         site-packages\_brotli*.pyd, site-packages\brotli and site-packages\brotlicffi
+      3. Node.js installs found by the same walk: node_modules\brotli,
+         node_modules\google-brotli and scoped node_modules\@scope\brotli
+         (Name and Version from package.json)
       4. Environment variables (machine, user and process scope) whose name or value contains brotli
-      5. Installed programs (uninstall registry) whose name contains brotli
+      5. Installed programs (uninstall registry: HKLM, WOW6432Node and every loaded
+         user hive under HKEY_USERS) whose name contains brotli
 
-    Runs locally by default. With -ComputerName it runs remotely over WinRM.
-    Read-only: nothing is installed, removed or changed.
+    Each drive is walked once; every path is reported once, under its most specific category.
+    Runs locally by default. With -ComputerName or -ListPath it runs remotely over WinRM.
+    Names that refer to this computer (localhost, ., 127.0.0.1, ::1, its own short or
+    DNS name) are scanned locally instead of over WinRM.
+
+    Read-only: nothing is installed, removed or changed on any target. The only files
+    written are the CSV report and the transcript log in -OutputPath. A CSV is written
+    on every run; it has only a header row when nothing was found.
+
+    Exit codes (highest applicable wins: 3 > 2 > 1 > 0):
+      0 = Scan complete, no Google Brotli traces found
+      1 = Scan complete, Google Brotli traces found (see CSV)
+      2 = One or more targets could not be scanned (CSV still holds any findings)
+      3 = Script error (invalid input, unexpected failure)
+
+    Supports -WhatIf and -Confirm. The script makes no state changes, so neither has an
+    effect on the scan; the report and log are always written as audit evidence.
 
 .PARAMETER ComputerName
     One or more server names. Default: the local computer.
 
 .PARAMETER ListPath
-    Path to a text file with one server name per line. Lines starting with # are ignored.
+    Path to a text file with one server name per line. Blank lines and text after # are ignored.
+    The file must contain at least one name.
 
 .PARAMETER Drives
-    Drive letters to scan for files and folders. Default: all fixed drives.
+    Drive letters to scan for files and folders, as C, C: or C:\. Default: all fixed drives.
+    Python and Node classification follows the same scope.
 
 .PARAMETER ExcludePath
-    Path fragments to skip during the file scan (for example a backup share).
+    Paths to skip during the file scan, for example D:\Backup. A path excludes itself and
+    everything below it (D:\Backup does not exclude D:\Backup2).
 
 .PARAMETER ThrottleLimit
-    Maximum number of parallel remote sessions. Default: 16.
+    Maximum number of parallel remote sessions, 1-64. Default: 16.
+
+.PARAMETER Credential
+    Credential for the remote WinRM sessions. Default: the current user. Not used for a local scan.
 
 .PARAMETER OutputPath
-    Folder for the CSV report and transcript log. Default: a 'Reports' folder next to the script.
+    Folder for the CSV report and transcript log. Default: a 'Reports' folder next to the
+    script, or under the current directory when the script path is unavailable.
 
 .EXAMPLE
     .\Scan-GoogleBrotli.ps1
@@ -49,130 +76,224 @@
 
     Scans two servers, only C: and D:, and skips D:\Backup.
 
+.EXAMPLE
+    .\Scan-GoogleBrotli.ps1 -ListPath .\servers.txt; "Exit code: $LASTEXITCODE"
+
+    Scans a list and shows the exit code for use in a scheduler or pipeline.
+
 .NOTES
-    Author : Tobias Tillstam / Tillnet
-    License: MIT
-    Version: 1.0
-    Output : Reports\GoogleBrotli-<timestamp>.csv and Reports\GoogleBrotli-<timestamp>.log
+    Author        : Tobias Tillstam, Tillnet
+    Webpage       : https://tillnet.se
+    GitHub        : https://github.com/tobiastillstam
+    Version       : 1.1.0
+    Date Created  : 2026-10-29
+    Last Modified : 2026-10-29
+
+    Change Log
+    ----------
+    1.1.0 (2026-10-29) - Aligned to the Tillnet template. Single walk per drive with
+                         Python/Node classified from it. Exit codes 0/1/2/3. CSV always
+                         written (header-only when clean), explicit columns, UTF-8.
+                         Local names scanned locally. Python module files, egg-info files,
+                         package.json names and scoped Node packages detected. ExcludePath
+                         prunes on path boundaries. Junctions and symlinks are not followed.
+                         HKEY_USERS uninstall keys. -Credential. Input validated in the body.
+    1.0.0 (2026-10-29) - Initial import.
+
+    Operational notes:
+    - Output: <OutputPath>\GoogleBrotli-<timestamp>.csv and .log.
+    - CSV columns: Computer, Category, Location, Detail. UTF-8 with BOM so non-ASCII
+      paths survive and Excel opens it correctly.
+    - A full walk of every fixed drive can take a long time on large file servers;
+      narrow it with -Drives and -ExcludePath.
+    - Junctions, symlinks and volume mount points are reported if their name matches but
+      are not followed. Volumes mounted only into a folder (no drive letter) are not walked.
+    - Folders that cannot be read are skipped and counted per target (see the log, and
+      -Verbose for the paths). They do not change the exit code.
+    - "User" environment variables and HKCU are those of the account running the scan.
+    - Brotli is bundled inside many products (browsers, web servers, runtimes). A
+      FileSystem hit is a lead to review, not proof of a vulnerable install.
+    - Parameter binding errors (unknown parameter name, value of the wrong type) are raised
+      by PowerShell before the script runs and exit with code 1, not 3.
 #>
-[CmdletBinding()]
+
+[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
 param(
+    # One or more server names to scan. Default: the local computer.
+    [Parameter(Mandatory = $false)]
     [string[]]$ComputerName,
+
+    # Text file with one server name per line; blank lines and text after # are ignored.
+    [Parameter(Mandatory = $false)]
     [string]$ListPath,
+
+    # Drive letters to walk (C, C: or C:\). Default: all fixed drives on each target.
+    [Parameter(Mandatory = $false)]
     [string[]]$Drives,
+
+    # Paths to skip during the file walk; each excludes itself and everything below it.
+    [Parameter(Mandatory = $false)]
     [string[]]$ExcludePath = @(),
-    [ValidateRange(1, 64)]
+
+    # Maximum number of parallel remote sessions (1-64).
+    [Parameter(Mandatory = $false)]
     [int]$ThrottleLimit = 16,
-    [string]$OutputPath = (Join-Path $PSScriptRoot 'Reports')
+
+    # Credential for remote WinRM sessions. Default: the current user.
+    [Parameter(Mandatory = $false)]
+    [System.Management.Automation.PSCredential]$Credential,
+
+    # Folder for the CSV report and transcript log. Default: <script folder>\Reports.
+    [Parameter(Mandatory = $false)]
+    [string]$OutputPath
 )
 
-# ============================================================================
-# Section: Scan block (runs on each target, locally or via Invoke-Command)
-# ============================================================================
+# -------------------------------------------------------------------------
+# Scan block (runs on each target, locally or via Invoke-Command)
+# -------------------------------------------------------------------------
+# Emits one 'Finding' record per hit, then exactly one 'Status' record. A target
+# without a Status record was not scanned.
 $ScanBlock = {
     param(
         [string[]]$Drives,
-        [string[]]$ExcludePath
+        [string[]]$ExcludePath,
+        [string]$VerbosePref = 'SilentlyContinue'
     )
 
-    $pattern = 'brotli'
-    $findings = New-Object System.Collections.Generic.List[object]
+    $VerbosePreference = $VerbosePref
+    $pattern      = 'brotli'
+    $ignoreCase   = [System.StringComparison]::OrdinalIgnoreCase
+    $findings     = New-Object System.Collections.Generic.List[object]
+    $warnings     = New-Object System.Collections.Generic.List[string]
+    $accessErrors = 0
+    $drivesDone   = 0
+    $excludes     = @($ExcludePath | Where-Object { $_ } | ForEach-Object { $_.Trim().TrimEnd('\') })
 
     function Add-Finding {
         param($Category, $Location, $Detail)
         $findings.Add([pscustomobject]@{
-            Computer = $env:COMPUTERNAME
-            Category = $Category
-            Location = $Location
-            Detail   = $Detail
+            RecordType = 'Finding'
+            Computer   = $env:COMPUTERNAME
+            Category   = $Category
+            Location   = $Location
+            Detail     = [string]$Detail
         })
     }
 
-    # --- 1. Files and folders named *brotli* -------------------------------
-    if (-not $Drives) {
-        $Drives = Get-CimInstance -ClassName Win32_LogicalDisk -Filter 'DriveType=3' |
-            ForEach-Object { $_.DeviceID.TrimEnd(':') }
+    function Test-Excluded {
+        param([string]$FullName)
+        foreach ($ex in $excludes) {
+            if ($FullName.Equals($ex, $ignoreCase) -or $FullName.StartsWith($ex + '\', $ignoreCase)) { return $true }
+        }
+        return $false
     }
+
+    function Read-PackageInfo {
+        # Returns "Name=<n> Version=<v>" from the first lines of a METADATA / PKG-INFO file
+        param([string]$Path)
+        $name = ''; $version = ''
+        if ([System.IO.File]::Exists($Path)) {
+            $head    = Get-Content -LiteralPath $Path -TotalCount 20 -ErrorAction SilentlyContinue
+            $name    = ($head | Where-Object { $_ -like 'Name:*' }    | Select-Object -First 1) -replace '^Name:\s*', ''
+            $version = ($head | Where-Object { $_ -like 'Version:*' } | Select-Object -First 1) -replace '^Version:\s*', ''
+        }
+        return "Name=$name Version=$version"
+    }
+
+    function Add-Classified {
+        # Records a *brotli* path under its most specific category
+        param([System.IO.FileSystemInfo]$Item, [bool]$IsDir)
+        $name       = $Item.Name
+        $parent     = if ($IsDir) { $Item.Parent } else { $Item.Directory }
+        $parentName = if ($parent) { $parent.Name } else { '' }
+
+        if ($name -match '^(google[_-])?brotli.*\.(dist-info|egg-info)$') {
+            # dist-info / egg-info folder, or an old-style egg-info file holding PKG-INFO itself
+            $meta = $Item.FullName
+            if ($IsDir) {
+                $meta = Join-Path $Item.FullName 'METADATA'
+                if (-not [System.IO.File]::Exists($meta)) { $meta = Join-Path $Item.FullName 'PKG-INFO' }
+            }
+            Add-Finding -Category 'Python' -Location $Item.FullName -Detail (Read-PackageInfo -Path $meta)
+        }
+        elseif ($parentName -eq 'site-packages' -and $IsDir -and $name -in @('brotli', 'brotlicffi')) {
+            Add-Finding -Category 'Python' -Location $Item.FullName -Detail 'site-packages module folder'
+        }
+        elseif ($parentName -eq 'site-packages' -and -not $IsDir -and $name -match '^_?brotli(\.[^.]+)*\.(py|pyd)$') {
+            Add-Finding -Category 'Python' -Location $Item.FullName -Detail 'site-packages module file'
+        }
+        elseif ($IsDir -and $name -in @('brotli', 'google-brotli') -and
+                ($parentName -eq 'node_modules' -or
+                 ($parentName.StartsWith('@') -and $parent.Parent -and $parent.Parent.Name -eq 'node_modules'))) {
+            $pkg = Join-Path $Item.FullName 'package.json'
+            $pkgName = ''; $pkgVersion = ''
+            if ([System.IO.File]::Exists($pkg)) {
+                $json = $null
+                try { $json = Get-Content -LiteralPath $pkg -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop } catch { $pkgVersion = 'unreadable' }
+                if ($json) { $pkgName = $json.name; $pkgVersion = $json.version }
+            }
+            Add-Finding -Category 'Node' -Location $Item.FullName -Detail "Name=$pkgName Version=$pkgVersion"
+        }
+        else {
+            $kind = if ($IsDir) { 'Folder' } else { 'File' }
+            Add-Finding -Category 'FileSystem' -Location $Item.FullName -Detail $kind
+        }
+    }
+
+    # --- 1-3. Single walk per drive: file system, Python, Node ---------------
+    if (-not ($Drives | Where-Object { $_ })) {
+        $Drives = @(Get-CimInstance -ClassName Win32_LogicalDisk -Filter 'DriveType=3' -ErrorAction SilentlyContinue |
+            ForEach-Object { $_.DeviceID.Substring(0, 1) })
+        if (-not $Drives) { $warnings.Add('No fixed drives could be enumerated (Win32_LogicalDisk)') }
+    }
+    $dirFlag     = [System.IO.FileAttributes]::Directory
+    $reparseFlag = [System.IO.FileAttributes]::ReparsePoint
     foreach ($d in $Drives) {
-        $root = "$($d.TrimEnd(':')):\"
-        if (-not (Test-Path -LiteralPath $root)) { continue }
-        Get-ChildItem -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue |
-            Where-Object {
-                $full = $_.FullName
-                $skip = $false
-                foreach ($ex in $ExcludePath) {
-                    if ($ex -and $full.StartsWith($ex, [StringComparison]::OrdinalIgnoreCase)) { $skip = $true; break }
+        $root = "$($d.Trim().Substring(0, 1).ToUpper()):\"
+        if (-not [System.IO.Directory]::Exists($root)) { $warnings.Add("Drive not found: $root"); continue }
+        $drivesDone++
+        if (Test-Excluded -FullName $root) { Write-Verbose "Excluded drive: $root"; continue }
+        Write-Verbose "Walking $root on $env:COMPUTERNAME"
+        $stack = New-Object System.Collections.Generic.Stack[System.IO.DirectoryInfo]
+        $stack.Push((New-Object System.IO.DirectoryInfo -ArgumentList $root))
+        while ($stack.Count -gt 0) {
+            $dir = $stack.Pop()
+            try { $entries = $dir.GetFileSystemInfos() }
+            catch {
+                $accessErrors++
+                Write-Verbose "Cannot read: $($dir.FullName) - $($_.Exception.Message)"
+                continue
+            }
+            foreach ($e in $entries) {
+                $isDir = ($e.Attributes -band $dirFlag) -ne 0
+                if ($e.Name.IndexOf($pattern, $ignoreCase) -ge 0 -and -not (Test-Excluded -FullName $e.FullName)) {
+                    Add-Classified -Item $e -IsDir $isDir
                 }
-                -not $skip -and $_.Name -match $pattern
-            } |
-            ForEach-Object {
-                $kind = if ($_.PSIsContainer) { 'Folder' } else { 'File' }
-                Add-Finding -Category 'FileSystem' -Location $_.FullName -Detail $kind
-            }
-    }
-
-    # --- 2. Python packages -------------------------------------------------
-    $pyRoots = New-Object System.Collections.Generic.List[string]
-    foreach ($base in @("$env:LOCALAPPDATA\Programs\Python", "$env:ProgramFiles", "${env:ProgramFiles(x86)}", "$env:ProgramData\anaconda3", "$env:USERPROFILE\anaconda3", "$env:USERPROFILE\miniconda3")) {
-        if ($base -and (Test-Path -LiteralPath $base)) { $pyRoots.Add($base) }
-    }
-    # Virtual environments and site-packages are found by a name-based scan above, plus explicit METADATA reads here
-    foreach ($root in $pyRoots) {
-        Get-ChildItem -LiteralPath $root -Recurse -Directory -Force -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -match '^(Brotli|brotli|google_brotli|google-brotli).*\.(dist-info|egg-info)$' } |
-            ForEach-Object {
-                $meta = Join-Path $_.FullName 'METADATA'
-                if (-not (Test-Path -LiteralPath $meta)) { $meta = Join-Path $_.FullName 'PKG-INFO' }
-                $name = ''; $version = ''
-                if (Test-Path -LiteralPath $meta) {
-                    $head = Get-Content -LiteralPath $meta -TotalCount 15 -ErrorAction SilentlyContinue
-                    $name    = ($head | Where-Object { $_ -like 'Name:*' }    | Select-Object -First 1) -replace '^Name:\s*', ''
-                    $version = ($head | Where-Object { $_ -like 'Version:*' } | Select-Object -First 1) -replace '^Version:\s*', ''
+                # Junctions, symlinks and mount points are not followed (loops, double counting)
+                if ($isDir -and ($e.Attributes -band $reparseFlag) -eq 0) {
+                    if ($excludes.Count -eq 0 -or -not (Test-Excluded -FullName $e.FullName)) { $stack.Push($e) }
                 }
-                Add-Finding -Category 'Python' -Location $_.FullName -Detail "Name=$name Version=$version"
             }
-    }
-    # Any pip-installed brotli module folder (module name is "brotli" or "_brotli")
-    foreach ($root in $pyRoots) {
-        Get-ChildItem -LiteralPath $root -Recurse -Directory -Force -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -in @('brotli', 'brotlicffi') -and $_.Parent.Name -eq 'site-packages' } |
-            ForEach-Object {
-                Add-Finding -Category 'Python' -Location $_.FullName -Detail 'site-packages module folder'
-            }
-    }
-
-    # --- 3. Node.js packages ------------------------------------------------
-    $nodeRoots = New-Object System.Collections.Generic.List[string]
-    foreach ($base in @("$env:ProgramFiles\nodejs", "$env:APPDATA\npm", "$env:USERPROFILE", "$env:ProgramData")) {
-        if ($base -and (Test-Path -LiteralPath $base)) { $nodeRoots.Add($base) }
-    }
-    foreach ($root in $nodeRoots) {
-        Get-ChildItem -LiteralPath $root -Recurse -Directory -Force -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -in @('brotli', 'google-brotli') -and $_.Parent.Name -eq 'node_modules' } |
-            ForEach-Object {
-                $pkg = Join-Path $_.FullName 'package.json'
-                $ver = ''
-                if (Test-Path -LiteralPath $pkg) {
-                    try { $ver = (Get-Content -LiteralPath $pkg -Raw | ConvertFrom-Json).version } catch { $ver = 'unreadable' }
-                }
-                Add-Finding -Category 'Node' -Location $_.FullName -Detail "Version=$ver"
-            }
+        }
     }
 
     # --- 4. Environment variables -------------------------------------------
+    $reportedNames = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
     foreach ($scope in 'Machine', 'User') {
-        [System.Environment]::GetEnvironmentVariables($scope.ToLower()) | Out-Null
         $vars = [System.Environment]::GetEnvironmentVariables([System.EnvironmentVariableTarget]::$scope)
         foreach ($key in $vars.Keys) {
             $val = [string]$vars[$key]
             if ($key -match $pattern -or $val -match $pattern) {
                 Add-Finding -Category 'EnvVar' -Location "$scope\$key" -Detail $val
+                [void]$reportedNames.Add($key)
             }
         }
     }
-    foreach ($key in (Get-ChildItem Env: -ErrorAction SilentlyContinue)) {
-        if ($key.Name -match $pattern -or [string]$key.Value -match $pattern) {
-            Add-Finding -Category 'EnvVar' -Location "Process\$($key.Name)" -Detail ([string]$key.Value)
+    # Process scope only adds variables not already reported from Machine / User (PATH is merged)
+    foreach ($var in (Get-ChildItem Env: -ErrorAction SilentlyContinue)) {
+        if ($reportedNames.Contains($var.Name)) { continue }
+        if ($var.Name -match $pattern -or [string]$var.Value -match $pattern) {
+            Add-Finding -Category 'EnvVar' -Location "Process\$($var.Name)" -Detail ([string]$var.Value)
         }
     }
 
@@ -180,91 +301,172 @@ $ScanBlock = {
     $uninstallKeys = @(
         'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
         'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
-        'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
+        'Registry::HKEY_USERS\*\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
     )
     Get-ItemProperty -Path $uninstallKeys -ErrorAction SilentlyContinue |
         Where-Object { $_.DisplayName -match $pattern } |
         ForEach-Object {
-            Add-Finding -Category 'InstalledProgram' -Location $_.PSPath -Detail "$($_.DisplayName) $($_.DisplayVersion)"
+            $location = $_.PSPath -replace '^Microsoft\.PowerShell\.Core\\Registry::', ''
+            Add-Finding -Category 'InstalledProgram' -Location $location -Detail ("$($_.DisplayName) $($_.DisplayVersion)".Trim())
         }
 
-    return $findings
+    # --- Emit ---------------------------------------------------------------
+    foreach ($f in $findings) { $f }
+    [pscustomobject]@{
+        RecordType   = 'Status'
+        Computer     = $env:COMPUTERNAME
+        Complete     = ($drivesDone -gt 0)
+        Findings     = $findings.Count
+        AccessErrors = $accessErrors
+        Warnings     = ($warnings -join '; ')
+    }
 }
 
-# ============================================================================
-# Section: Resolve target list
-# ============================================================================
-Write-Verbose '--- Resolving target list ---'
-$targets = @()
-if ($ListPath) {
-    if (-not (Test-Path -LiteralPath $ListPath)) { throw "ListPath not found: $ListPath" }
-    $targets += Get-Content -LiteralPath $ListPath |
-        ForEach-Object { $_.Trim() } |
-        Where-Object { $_ -and -not $_.StartsWith('#') }
-}
-if ($ComputerName) { $targets += $ComputerName }
-$targets = $targets | Select-Object -Unique
-$runLocal = -not $targets
-if ($runLocal) { $targets = @($env:COMPUTERNAME) }
-Write-Verbose ("Targets: {0}" -f ($targets -join ', '))
+# -------------------------------------------------------------------------
+# Begin script body
+# -------------------------------------------------------------------------
 
-# ============================================================================
-# Section: Logging setup
-# ============================================================================
-if (-not (Test-Path -LiteralPath $OutputPath)) { New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null }
-$stamp   = Get-Date -Format 'yyyyMMdd-HHmmss'
-$csvPath = Join-Path $OutputPath "GoogleBrotli-$stamp.csv"
-$logPath = Join-Path $OutputPath "GoogleBrotli-$stamp.log"
-Start-Transcript -Path $logPath -Force | Out-Null
+Write-Verbose "Starting $($MyInvocation.MyCommand.Name)"
 
-# ============================================================================
-# Section: Scan
-# ============================================================================
-$all = New-Object System.Collections.Generic.List[object]
-$failed = New-Object System.Collections.Generic.List[string]
+$exitCode          = 3
+$transcriptStarted = $false
+$csvPath           = $null
+$logPath           = $null
+$csvHeader         = '"Computer","Category","Location","Detail"'
+$csvEncoding       = if ($PSVersionTable.PSVersion.Major -ge 6) { 'utf8BOM' } else { 'UTF8' }
+$allFindings       = New-Object System.Collections.Generic.List[object]
+$failed            = New-Object System.Collections.Generic.List[string]
+$scannedCount      = 0
 
 try {
-    if ($runLocal) {
-        Write-Verbose '--- Scanning local computer ---'
-        try {
-            $r = & $ScanBlock $Drives $ExcludePath
-            foreach ($f in $r) { $all.Add($f) }
-        } catch {
-            Write-Warning "Local scan failed: $($_.Exception.Message)"
-            $failed.Add($env:COMPUTERNAME)
+    # --- Output paths and transcript -------------------------------------
+    # Report files are audit evidence, not state changes: written even under -WhatIf / -Confirm.
+    if (-not $OutputPath) {
+        $baseDir    = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+        $OutputPath = Join-Path $baseDir 'Reports'
+    }
+    if (-not (Test-Path -LiteralPath $OutputPath -PathType Container)) {
+        New-Item -ItemType Directory -Path $OutputPath -Force -WhatIf:$false -Confirm:$false -ErrorAction Stop | Out-Null
+    }
+    $stamp   = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $csvPath = Join-Path $OutputPath "GoogleBrotli-$stamp.csv"
+    $logPath = Join-Path $OutputPath "GoogleBrotli-$stamp.log"
+    Start-Transcript -LiteralPath $logPath -Force -WhatIf:$false -Confirm:$false -ErrorAction Stop | Out-Null
+    $transcriptStarted = $true
+    Write-Verbose "Scan-GoogleBrotli 1.1.0 on $env:COMPUTERNAME as $([Environment]::UserDomainName)\$([Environment]::UserName)"
+    if ($WhatIfPreference) { Write-Host 'Read-only scan: -WhatIf has no effect; the report and log are still written.' }
+
+    # --- Input validation ------------------------------------------------
+    # powershell.exe -File passes "A,B" as one string; names and drive letters never hold commas
+    $ComputerName = @($ComputerName | ForEach-Object { ([string]$_) -split ',' } | Where-Object { $_.Trim() })
+    $Drives       = @($Drives | ForEach-Object { ([string]$_) -split ',' } | Where-Object { $_.Trim() })
+    if ($ThrottleLimit -lt 1 -or $ThrottleLimit -gt 64) { throw "ThrottleLimit must be 1-64, got $ThrottleLimit" }
+    foreach ($d in $Drives) {
+        if ([string]$d -notmatch '^\s*[A-Za-z](:\\?)?\s*$') { throw "Invalid drive '$d'. Use a letter such as C, C: or C:\" }
+    }
+
+    # --- Resolve target list ---------------------------------------------
+    Write-Verbose '--- Resolving target list ---'
+    $targets = New-Object System.Collections.Generic.List[string]
+    $seen    = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    $names   = @()
+    if ($PSBoundParameters.ContainsKey('ListPath')) {
+        if (-not $ListPath -or -not (Test-Path -LiteralPath $ListPath -PathType Leaf)) { throw "ListPath not found: $ListPath" }
+        $fromList = @(Get-Content -LiteralPath $ListPath -ErrorAction Stop |
+            ForEach-Object { ($_ -replace '#.*$', '').Trim() } |
+            Where-Object { $_ })
+        if ($fromList.Count -eq 0) { throw "ListPath contains no target names: $ListPath" }
+        $names += $fromList
+    }
+    if ($ComputerName) { $names += @($ComputerName | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ }) }
+    foreach ($n in $names) { if ($seen.Add($n)) { $targets.Add($n) } }
+    if ($targets.Count -eq 0) { $targets.Add($env:COMPUTERNAME) }
+
+    # Names that mean "this computer" are scanned in-process, never over WinRM
+    $localNames = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($n in @('localhost', '.', '127.0.0.1', '::1', $env:COMPUTERNAME)) { [void]$localNames.Add($n) }
+    $dnsDomain = [System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().DomainName
+    if ($dnsDomain) { [void]$localNames.Add("$env:COMPUTERNAME.$dnsDomain") }
+    $localTargets  = @($targets | Where-Object { $localNames.Contains($_) })
+    $remoteTargets = @($targets | Where-Object { -not $localNames.Contains($_) })
+    Write-Verbose ("Targets: {0}" -f ($targets -join ', '))
+
+    # --- Scan ------------------------------------------------------------
+    $statusRecords = New-Object System.Collections.Generic.List[object]
+    if ($localTargets.Count -gt 0) {
+        Write-Verbose "--- Scanning local computer ($($localTargets -join ', ')) ---"
+        foreach ($rec in (& $ScanBlock $Drives $ExcludePath ([string]$VerbosePreference))) {
+            if ($rec.RecordType -eq 'Status') {
+                $rec | Add-Member -NotePropertyName Target -NotePropertyValue $localTargets[0]
+                $statusRecords.Add($rec)
+            }
+            else { $allFindings.Add($rec) }
         }
     }
-    else {
-        Write-Verbose '--- Scanning remote targets ---'
-        $sessionResults = Invoke-Command -ComputerName $targets -ScriptBlock $ScanBlock `
-            -ArgumentList (, $Drives), (, $ExcludePath) -ThrottleLimit $ThrottleLimit `
-            -ErrorVariable connErrors -ErrorAction SilentlyContinue
-        foreach ($f in $sessionResults) { $all.Add($f) }
-        foreach ($e in $connErrors) {
-            Write-Warning "Remote error: $($e.Exception.Message)"
-            $failed.Add([string]$e.TargetObject)
+    if ($remoteTargets.Count -gt 0) {
+        Write-Verbose "--- Scanning remote targets ($($remoteTargets -join ', ')) ---"
+        $icmParams = @{
+            ComputerName  = $remoteTargets
+            ScriptBlock   = $ScanBlock
+            ArgumentList  = $Drives, $ExcludePath, ([string]$VerbosePreference)
+            ThrottleLimit = $ThrottleLimit
+            ErrorAction   = 'SilentlyContinue'
+            ErrorVariable = 'remoteErrors'
+        }
+        if ($Credential) { $icmParams.Credential = $Credential }
+        $remoteResults = Invoke-Command @icmParams
+        foreach ($rec in $remoteResults) {
+            if ($rec.RecordType -eq 'Status') {
+                $rec | Add-Member -NotePropertyName Target -NotePropertyValue $rec.PSComputerName -Force
+                $statusRecords.Add($rec)
+            }
+            elseif ($rec.RecordType -eq 'Finding') { $allFindings.Add($rec) }
+        }
+        foreach ($err in $remoteErrors) { Write-Warning "Remote error: $($err.Exception.Message)" }
+        $answered = @($statusRecords | ForEach-Object { [string]$_.Target })
+        foreach ($t in $remoteTargets) {
+            if ($answered -notcontains $t) { $failed.Add($t) }
         }
     }
+
+    # --- Per-target summary ----------------------------------------------
+    foreach ($s in $statusRecords) {
+        $line = "{0}: {1} finding(s), {2} unreadable folder(s)" -f $s.Target, $s.Findings, $s.AccessErrors
+        if ($s.Warnings) { $line += "; $($s.Warnings)" }
+        Write-Host $line
+        if (-not $s.Complete) { $failed.Add([string]$s.Target) }
+        else { $scannedCount++ }
+    }
+
+    if ($failed.Count -gt 0)          { $exitCode = 2 }
+    elseif ($allFindings.Count -gt 0) { $exitCode = 1 }
+    else                              { $exitCode = 0 }
 }
 catch {
-    Write-Error "Scan aborted: $($_.Exception.Message)"
+    $exitCode = 3
+    Write-Error $_
+    throw
 }
 finally {
-    # ========================================================================
-    # Section: Report
-    # ========================================================================
-    Write-Verbose '--- Writing report ---'
-    if ($all.Count -gt 0) {
-        $all | Export-Csv -LiteralPath $csvPath -NoTypeInformation -Encoding ASCII
-        Write-Host ("Found {0} item(s). Report: {1}" -f $all.Count, $csvPath)
+    # --- Report ----------------------------------------------------------
+    if ($csvPath) {
+        $rows = @($allFindings |
+            Sort-Object -Property Computer, Category, Location |
+            Select-Object -Property Computer, Category, Location, Detail)
+        if ($rows.Count -gt 0) {
+            $rows | Export-Csv -LiteralPath $csvPath -NoTypeInformation -Encoding $csvEncoding -WhatIf:$false -Confirm:$false
+        }
+        else {
+            Set-Content -LiteralPath $csvPath -Value $csvHeader -Encoding $csvEncoding -WhatIf:$false -Confirm:$false
+        }
+        if ($failed.Count -gt 0) { Write-Warning ("Could not scan: {0}" -f (($failed | Sort-Object -Unique) -join ', ')) }
+        if ($allFindings.Count -gt 0) { Write-Host ("Found {0} item(s) on {1} scanned target(s)." -f $allFindings.Count, $scannedCount) }
+        elseif ($exitCode -ne 3)      { Write-Host ("No Google Brotli traces found on {0} scanned target(s)." -f $scannedCount) }
+        Write-Host ("Report: {0}" -f $csvPath)
+        Write-Host ("Log: {0}" -f $logPath)
     }
-    else {
-        Write-Host 'No Google Brotli traces found on the scanned targets.'
-    }
-    $uniqueFailed = $failed | Select-Object -Unique
-    if ($uniqueFailed) {
-        Write-Warning ("Could not scan: {0}" -f ($uniqueFailed -join ', '))
-    }
-    Write-Host ("Log: {0}" -f $logPath)
-    Stop-Transcript | Out-Null
+    Write-Host ("Exit code: {0}" -f $exitCode)
+    if ($transcriptStarted) { Stop-Transcript | Out-Null }
+    Write-Verbose "Finished $($MyInvocation.MyCommand.Name)"
+    exit $exitCode
 }
