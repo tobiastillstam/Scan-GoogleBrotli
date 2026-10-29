@@ -1,0 +1,22 @@
+# Run output (transcripts, CSV reports)
+Reports/
+Logs/
+*.log
+*.csv
+
+# Local target lists (may contain internal host names)
+servers.txt
+
+# Local tests and fixtures (kept local, not published)
+Tests/
+
+# OS / editor cruft
+Thumbs.db
+desktop.ini
+.vs/
+.vscode/
+*.tmp
+*~
+
+# Private Claude notes (never commit)
+CLAUDE.local.md
